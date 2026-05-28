@@ -216,3 +216,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ===== nano-llm artifacts =====
+# Pre-tokenized corpora (uint16 memmap)
+*.bin
+# Trained checkpoints
+*.pt
+*.tmp
+# Output / work directories
+checkpoints/
+_smoke_run/
+data/
+outputs/
+# HF datasets/tokenizers caches when stored locally
+.hf_cache/
+# Trained tokenizer artifacts at repo root (the tokenizer lives under out_dir)
+tokenizer.json

@@ -1,0 +1,8 @@
+# Pinned to versions known to coexist on a Kaggle Python 3.10/3.11 image.
+# torch is pre-installed on Kaggle; pinning here keeps local installs reproducible.
+torch==2.4.1
+numpy==1.26.4
+tokenizers==0.20.3
+datasets==3.0.2
+pyyaml==6.0.2
+tqdm==4.66.5
