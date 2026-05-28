@@ -1,0 +1,54 @@
+# Real run: ~30M-param decoder on TinyStories, sized for Kaggle 2xT4 / 12h sessions.
+# n_embd=512 / n_head=8 / n_layer=8 / block_size=512 with SwiGLU(hidden=1408)
+# tied embed: 8192*512 = 4.2M
+# per layer:  attn 4*512^2 + SwiGLU 3*512*1408 ~= 3.2M
+# 8 layers ~= 25.6M, total ~30M.
+seed: 1337
+out_dir: /kaggle/working/checkpoints
+# resume_from: /kaggle/input/nano-llm-checkpoints/ckpt_step10000.pt   # optional
+
+tokenizer:
+  type: bpe
+  vocab_size: 8192
+  train_subset_docs: 50000   # plenty for a stable BPE on TinyStories
+
+data:
+  dataset: roneneldan/TinyStories
+  text_field: text
+  # subset_train / subset_val omitted -> use the full split
+
+model:
+  n_layer: 8
+  n_head: 8
+  n_embd: 512
+  block_size: 512
+  dropout: 0.1
+  # mlp_hidden auto = round_to_64(8/3 * 512) = 1408
+  rope_base: 10000.0
+
+train:
+  device: cuda
+  precision: fp16            # T4 has no real bf16
+  distributed: true          # mp.spawn DDP across both T4s
+  batch_size: 32             # per-GPU micro-batch
+  grad_accum: 8              # effective batch = 32 * 8 * world_size
+  max_steps: 20000
+  learning_rate: 6.0e-4
+  min_lr: 6.0e-5
+  beta1: 0.9
+  beta2: 0.95
+  weight_decay: 0.1
+  grad_clip: 1.0
+  warmup_steps: 200
+  eval_interval: 200
+  eval_iters: 50
+  sample_interval: 500
+  checkpoint_interval: 500
+  keep_last_k: 3
+
+sample:
+  prompt: "Once upon a time, there was a little"
+  max_new_tokens: 200
+  temperature: 0.8
+  top_k: 40
+  top_p: 0.9
