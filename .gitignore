@@ -232,3 +232,4 @@ outputs/
 .hf_cache/
 # Trained tokenizer artifacts at repo root (the tokenizer lives under out_dir)
 tokenizer.json
+MEMORY.md

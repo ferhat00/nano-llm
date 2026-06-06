@@ -7,12 +7,17 @@ Stages (in order, each idempotent unless --force):
   4. eval       -- final val loss + perplexity on the latest checkpoint
   5. sample     -- generate text from the latest checkpoint
 
+Optional stages (named explicitly; not part of --stage all):
+  push          -- upload the latest checkpoint + tokenizer to the Hugging Face Hub
+
 Usage:
   python orchestrate.py --config configs/smoke.yaml
   python orchestrate.py --config configs/small.yaml --force
   python orchestrate.py --config configs/smoke.yaml --stage train
   python orchestrate.py --config configs/small.yaml --train.max_steps=500 --model.n_layer=4
   python orchestrate.py --config configs/small.yaml --resume-from /path/to/ckpt.pt
+  python orchestrate.py --config configs/small.yaml --stage push \
+      --huggingface.repo_id=<user>/nano-llm-tinystories
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torch
 
 from src import data as data_mod
+from src import hf_push as hf_push_mod
 from src import sample as sample_mod
 from src import tokenizer as tok_mod
 from src import train as train_mod
@@ -43,7 +49,10 @@ from src.utils import (
 )
 
 
+# Default pipeline run by `--stage all`.
 STAGES = ("tokenizer", "data", "train", "eval", "sample")
+# Optional stages, only runnable when named explicitly (not part of `all`).
+OPTIONAL_STAGES = ("push",)
 
 
 # ---------------------------------------------------------------------------
@@ -56,8 +65,9 @@ def parse_cli(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument("--config", required=True, help="path to YAML config")
-    ap.add_argument("--stage", choices=("all", *STAGES), default="all",
-                    help="run only this stage; 'all' runs the full pipeline")
+    ap.add_argument("--stage", choices=("all", *STAGES, *OPTIONAL_STAGES), default="all",
+                    help="run only this stage; 'all' runs the full pipeline "
+                         "(optional stages like 'push' must be named explicitly)")
     ap.add_argument("--force", action="store_true",
                     help="ignore stage idempotency (retrain tokenizer, re-tokenize data)")
     ap.add_argument("--resume-from", default=None,
@@ -181,6 +191,11 @@ def stage_sample(cfg: dict, tokenizer_path: str) -> None:
     sample_mod.run_from_config(cfg, out_dir, tokenizer_path)
 
 
+def stage_push(cfg: dict, tokenizer_path: str) -> None:
+    """Push the latest checkpoint + tokenizer to the Hugging Face Hub."""
+    hf_push_mod.push_to_hub(cfg, cfg["out_dir"], tokenizer_path)
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -228,6 +243,10 @@ def main(argv: list[str] | None = None) -> int:
     if "sample" in selected:
         banner("STAGE 5 / sample", char="-")
         stage_sample(cfg, state["tokenizer_path"])
+
+    if "push" in selected:
+        banner("STAGE / push to Hugging Face", char="-")
+        stage_push(cfg, state["tokenizer_path"])
 
     banner("done")
     return 0

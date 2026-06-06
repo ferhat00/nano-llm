@@ -4,5 +4,6 @@ torch==2.4.1
 numpy==1.26.4
 tokenizers==0.20.3
 datasets==3.0.2
+huggingface_hub==0.25.2   # explicit pin (also a datasets dep); used by the `push` stage
 pyyaml==6.0.2
 tqdm==4.66.5

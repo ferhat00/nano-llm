@@ -52,3 +52,9 @@ sample:
   temperature: 0.8
   top_k: 40
   top_p: 0.9
+
+huggingface:
+  # Only used by the optional `push` stage: python orchestrate.py --stage push ...
+  repo_id: ferhat00/nano-llm-tinystories   # fill in your HF username
+  private: false
+  # token is read from the HF_TOKEN env var (set from Kaggle Secrets in the notebook)
