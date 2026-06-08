@@ -32,7 +32,7 @@ train:
   distributed: true          # mp.spawn DDP across both T4s
   batch_size: 32             # per-GPU micro-batch
   grad_accum: 8              # effective batch = 32 * 8 * world_size
-  max_steps: 20000
+  max_steps: 2000
   learning_rate: 6.0e-4
   min_lr: 6.0e-5
   beta1: 0.9
