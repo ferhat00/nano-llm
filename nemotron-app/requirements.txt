@@ -1,0 +1,26 @@
+# nemotron-app dependencies — pinned to the versions resolved in the repo's
+# local_nemotron venv (Python 3.11, torch 2.6.0+cu124). torch is intentionally
+# NOT pinned here: it is the existing CUDA build, reused as-is and pulled in
+# transitively by sentence-transformers. Install with:
+#   ..\local_nemotron\Scripts\python.exe -m pip install -r requirements.txt
+
+# Web UI
+streamlit==1.58.0
+
+# LLM prompt building (AutoTokenizer only — no model imports)
+transformers==5.12.0
+
+# RAG: embeddings + vector store + document loaders
+sentence-transformers==5.5.1
+chromadb==1.5.9
+pypdf==6.13.2
+python-docx==1.2.0
+
+# Web search + page fetching
+ddgs==9.14.4
+beautifulsoup4==4.15.0
+
+# Config / HTTP / env (also used by the notebook; listed for a standalone install)
+PyYAML==6.0.3
+requests==2.34.2
+python-dotenv==1.2.2

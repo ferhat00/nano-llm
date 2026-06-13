@@ -237,6 +237,10 @@ models/
 *.gguf
 # Prebuilt llama.cpp server binaries + bundled CUDA runtime (~1.3 GB, re-downloaded by Cell 01)
 llama-bin/
+# Streamlit app local artifacts (Chroma store, uploaded docs, server.log)
+# (the generic `data/` and `.env` rules above already cover these; explicit for clarity)
+nemotron-app/data/
+nemotron-app/.env
 # Trained tokenizer artifacts at repo root (the tokenizer lives under out_dir)
 tokenizer.json
 MEMORY.md

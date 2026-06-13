@@ -1,0 +1,81 @@
+# nemotron-app configuration — every tunable lives here (no magic numbers in code).
+# Relative paths are resolved against this file's directory (nemotron-app/).
+# Secrets (HF_TOKEN, TAVILY_API_KEY) come from .env / environment, never this file.
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  # Reuse the artifacts the nemotron-local notebook already downloaded.
+  binary_path: ../nemotron-local/llama-bin/bin/llama-server.exe
+  gguf_path: ../nemotron-local/models/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf
+  n_ctx: 16384            # 16k; the SSM-hybrid KV cache makes this cheap
+  n_gpu_layers: 999       # offload every layer to the GPU (-ngl); -1 also means "all"
+  flash_attn: true        # Ampere (cc 8.6) supports FlashAttention -> -fa on
+  startup_timeout_s: 240  # how long to wait for /health after launching the server
+  reuse_existing: true    # if a server is already healthy on host:port, attach to it
+
+tokenizer:
+  # Weights-free AutoTokenizer load, only for apply_chat_template (enable_thinking).
+  repo_id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+  cache_dir: ../nemotron-local/hf-cache/hub   # HF hub cache populated by the notebook
+
+sampling:
+  temperature: 0.6
+  top_p: 0.95
+  max_new_tokens: 512
+  stop: ["<|im_end|>", "<|endoftext|>", "</s>"]
+
+reasoning:
+  thinking_default: true
+  thinking_budget: null   # null = uncapped; int = best-effort cap on reasoning tokens
+
+rag:
+  enabled_default: false
+  embedding_model: BAAI/bge-small-en-v1.5
+  embedding_device: cpu   # cpu | cuda  (cpu avoids contention with the llama-server)
+  chunk_size: 800         # characters per chunk
+  chunk_overlap: 120      # character overlap between adjacent chunks
+  top_k: 4                # chunks retrieved per query
+  max_context_chars: 8000 # hard cap on injected RAG context (keeps the 16k window safe)
+  persist_dir: ./data/chroma
+  collection_name: user_docs
+  # bge models want this instruction prefixed to the query (not the documents).
+  query_instruction: "Represent this sentence for searching relevant passages: "
+  supported_extensions: [pdf, txt, md, docx]
+
+web_search:
+  enabled_default: false
+  provider: duckduckgo    # duckduckgo (no key) | tavily (needs TAVILY_API_KEY)
+  result_count: 5
+  fetch_pages: false      # if true, fetch + strip each top result page for fuller context
+  fetch_char_limit: 2000  # max chars kept per fetched page
+  request_timeout_s: 8    # per-request HTTP timeout when fetching pages
+  total_time_budget_s: 20 # overall budget for the fetch phase
+  max_context_chars: 6000 # hard cap on injected web context
+
+prompts:
+  chat_system: "You are a helpful, concise assistant."
+  coding_system: >-
+    You are an expert programmer. Give correct, runnable code in fenced code
+    blocks with a language tag. Explain briefly first, then show the code. Prefer
+    standard libraries and idiomatic, readable style.
+  # Header prepended to retrieved document context. {context} is filled in by the app.
+  rag_system: >-
+    Use the following document excerpts to answer the user's question. Cite
+    sources inline as [filename p.N]. If the answer is not in the excerpts, say
+    you could not find it in the provided documents.
+  # Header prepended to web-search results. {context} is filled in by the app.
+  web_system: >-
+    Use the following web search results to answer the user's question. Cite
+    sources inline as [n] using the result numbers. Prefer recent, relevant
+    results and note if the results do not contain the answer.
+
+ui:
+  temperature_range: [0.0, 1.5]
+  top_p_range: [0.1, 1.0]
+  max_new_tokens_range: [64, 4096]
+
+gpu:
+  show_vram: true       # live VRAM meter in the sidebar (reads nvidia-smi)
+  refresh_seconds: 2     # how often the meter polls nvidia-smi
+  device_index: 0        # which GPU to display
