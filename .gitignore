@@ -156,6 +156,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+local_nemotron/
 
 # Spyder project settings
 .spyderproject
@@ -230,6 +231,12 @@ data/
 outputs/
 # HF datasets/tokenizers caches when stored locally
 .hf_cache/
+# Local Nemotron notebook downloads (multi-GB GGUF weights + HF cache)
+hf-cache/
+models/
+*.gguf
+# Prebuilt llama.cpp server binaries + bundled CUDA runtime (~1.3 GB, re-downloaded by Cell 01)
+llama-bin/
 # Trained tokenizer artifacts at repo root (the tokenizer lives under out_dir)
 tokenizer.json
 MEMORY.md
