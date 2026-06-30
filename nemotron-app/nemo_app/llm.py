@@ -1,11 +1,12 @@
-"""LLM backend: llama-server lifecycle + prompt building + streaming.
+"""LLM backend: llama-server lifecycle + chat streaming.
 
-Mirrors the proven patterns in
-`nemotron-local/nemotron_nano_4b_local_rtx3060.ipynb` (Cells 03/04 and the
-generation core): launch the prebuilt `llama-server.exe`, render prompts with the
-HF tokenizer's `enable_thinking` switch, and stream raw `/v1/completions` so the
-reasoning toggle works per-request. The app talks HTTP only — one process, one
-copy of the weights.
+Launches the prebuilt `llama-server.exe` for the selected model (a local GGUF or an
+`-hf` auto-download) and streams `/v1/chat/completions`. Templating is server-side:
+`--jinja` makes llama-server apply each GGUF's own embedded chat template and stop
+tokens, and `--reasoning-format` surfaces `<think>` reasoning in a separate field, so
+the app sends `messages` (not a pre-rendered prompt) and works across model families.
+The reasoning toggle is passed per-request via `chat_template_kwargs`. The app talks
+HTTP only — one process, one copy of the weights.
 """
 from __future__ import annotations
 
@@ -16,17 +17,13 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
-from typing import Iterator, List, Optional
+from typing import Iterator, Optional, Tuple
 
-import re
 import requests
 
-from .config import AppConfig, SamplingConfig
+from .config import AppConfig, ModelConfig, SamplingConfig
 
 log = logging.getLogger(__name__)
-
-# Stop strings for the Nemotron ChatML template (matches the notebook).
-NEMO_STOPS: List[str] = ["<|im_end|>", "<|endoftext|>", "</s>"]
 
 # Keep Windows Job Object handles alive for the process lifetime. Closing a job
 # handle is what triggers KILL_ON_JOB_CLOSE, so these must NOT be garbage
@@ -48,6 +45,48 @@ def _health_ok(base_url: str, timeout: float = 2.0) -> bool:
         return requests.get(base_url + "/health", timeout=timeout).status_code == 200
     except Exception:
         return False
+
+
+def _loaded_model_basename(base_url: str, timeout: float = 2.0) -> Optional[str]:
+    """Basename of the model a running server has loaded, via /props (best-effort).
+
+    The field name varies across llama.cpp builds, so a few keys are tried.
+    """
+    try:
+        j = requests.get(base_url + "/props", timeout=timeout).json()
+    except Exception:
+        return None
+    if not isinstance(j, dict):
+        return None
+    for key in ("model_path", "model"):
+        v = j.get(key)
+        if isinstance(v, str) and v:
+            return os.path.basename(v)
+    gen = j.get("default_generation_settings") or {}
+    v = gen.get("model") if isinstance(gen, dict) else None
+    if isinstance(v, str) and v:
+        return os.path.basename(v)
+    return None
+
+
+def _server_matches(model: ModelConfig, loaded_basename: Optional[str]) -> bool:
+    """Best-effort check that a reusable server is running the expected model.
+
+    Local models match on exact GGUF basename. Auto-download (-hf) models can't know
+    the cached filename ahead of time, so they match heuristically on the quant tag
+    plus a distinctive fragment of the repo id. A false negative just forces a manual
+    "Free VRAM", which is the safe direction — it never serves the wrong weights.
+    """
+    if not loaded_basename:
+        return False
+    name = loaded_basename.lower()
+    if model.gguf_path:
+        return os.path.basename(model.gguf_path).lower() == name
+    if model.quant and model.quant.lower() not in name:
+        return False
+    stem = model.hf_repo.split("/")[-1].lower().replace("-gguf", "")
+    head = stem.split("_")[-1].split("-")[0]   # e.g. "qwen3", "phi", "gemma", "smollm3"
+    return bool(head) and head in name
 
 
 def _terminate(proc: Optional[subprocess.Popen]) -> None:
@@ -159,38 +198,63 @@ def shutdown_server(handle: "ServerHandle") -> str:
     return "external"
 
 
-def ensure_server(cfg: AppConfig, log_dir: Optional[str] = None) -> ServerHandle:
-    """Detect a healthy server on host:port and reuse it; otherwise launch one.
+def ensure_server(cfg: AppConfig, model: ModelConfig,
+                  log_dir: Optional[str] = None) -> ServerHandle:
+    """Detect a healthy server for `model` on host:port and reuse it; else launch one.
 
-    Reuse avoids loading a second copy of the weights when the notebook (or a
-    previous app run) already has the server up. A freshly launched server is
+    Reuse avoids a second copy of the weights when the notebook (or a previous app run)
+    already serves the SAME model. If a healthy server is up but running a DIFFERENT
+    model, we refuse to attach — serving the wrong weights would be a silent
+    correctness bug — and raise so the caller can free it. A freshly launched server is
     terminated on interpreter exit via atexit.
     """
     base_url = cfg.server.base_url
     if cfg.server.reuse_existing and _health_ok(base_url):
-        return ServerHandle(base_url=base_url, proc=None, owned=False)
+        loaded = _loaded_model_basename(base_url)
+        if _server_matches(model, loaded):
+            return ServerHandle(base_url=base_url, proc=None, owned=False)
+        raise RuntimeError(
+            f"A llama-server is already running on {cfg.server.host}:{cfg.server.port} "
+            f"with a different model ('{loaded or 'unknown'}'); the selected model is "
+            f"'{model.label}'. Stop it first (sidebar ♻️ Free VRAM, or stop the "
+            f"notebook's server) and retry."
+        )
 
-    exe, gguf = cfg.server.binary_path, cfg.server.gguf_path
+    exe = cfg.server.binary_path
     if not os.path.isfile(exe):
         raise FileNotFoundError(
             f"llama-server.exe not found at {exe}. Run the nemotron-local notebook's "
             f"setup (Cell 01) first, or fix server.binary_path in config.yaml."
         )
-    if not os.path.isfile(gguf):
-        raise FileNotFoundError(
-            f"GGUF model not found at {gguf}. Run the nemotron-local notebook's "
-            f"download (Cell 02) first, or fix server.gguf_path in config.yaml."
-        )
 
-    ngl = cfg.server.n_gpu_layers if cfg.server.n_gpu_layers >= 0 else 999
+    # Weight source: a local GGUF file, or an -hf repo:quant auto-download.
+    if model.gguf_path:
+        if not os.path.isfile(model.gguf_path):
+            raise FileNotFoundError(
+                f"GGUF for model '{model.label}' not found at {model.gguf_path}. Run "
+                f"the nemotron-local notebook's download (Cell 02), or fix the "
+                f"gguf_path for '{model.name}' in config.yaml."
+            )
+        source = ["-m", model.gguf_path]
+    else:
+        source = ["-hf", model.hf_spec]   # llama-server downloads + caches on first use
+
+    ngl = cfg.server.n_gpu_layers if cfg.server.n_gpu_layers >= 0 else 99
     cmd = [
-        exe, "-m", gguf,
+        exe, *source,
         "-ngl", str(ngl),
-        "-c", str(cfg.server.n_ctx),
+        "-c", str(model.n_ctx),
         "-fa", "on" if cfg.server.flash_attn else "off",
+        "-np", "1",
         "--host", cfg.server.host,
         "--port", str(cfg.server.port),
     ]
+    if cfg.server.flash_attn:   # quantized KV cache requires flash attention
+        cmd += ["-ctk", cfg.server.cache_type_k, "-ctv", cfg.server.cache_type_v]
+    if cfg.server.jinja:
+        cmd.append("--jinja")
+    if cfg.server.reasoning_format and cfg.server.reasoning_format.lower() != "none":
+        cmd += ["--reasoning-format", cfg.server.reasoning_format]
 
     log_dir = log_dir or cfg.data_dir
     os.makedirs(log_dir, exist_ok=True)
@@ -200,13 +264,14 @@ def ensure_server(cfg: AppConfig, log_dir: Optional[str] = None) -> ServerHandle
     _assign_to_kill_on_close_job(proc)   # orphan-proof against abrupt app exit
     atexit.register(_terminate, proc)    # clean-exit path
 
-    # Poll /health until ready, failing fast if the process dies early.
+    # Poll /health until ready, failing fast if the process dies early. The timeout is
+    # generous (config) because an -hf model downloads several GB on first launch.
     t0 = time.time()
     while time.time() - t0 < cfg.server.startup_timeout_s:
         if proc.poll() is not None:
             raise RuntimeError(
-                f"llama-server exited during startup (code {proc.returncode}); "
-                f"see {log_path}."
+                f"llama-server exited during startup (code {proc.returncode}) while "
+                f"loading '{model.label}'; see {log_path}."
             )
         if _health_ok(base_url):
             return ServerHandle(base_url=base_url, proc=proc, owned=True)
@@ -214,45 +279,12 @@ def ensure_server(cfg: AppConfig, log_dir: Optional[str] = None) -> ServerHandle
 
     _terminate(proc)
     raise TimeoutError(
-        f"llama-server did not become healthy within {cfg.server.startup_timeout_s}s; "
-        f"see {log_path}."
+        f"llama-server did not become healthy within {cfg.server.startup_timeout_s}s "
+        f"while loading '{model.label}'; see {log_path}."
     )
 
 
-# --------------------------------------------------------------------------- prompt building
-def supports_thinking_kwarg(tokenizer) -> bool:
-    tmpl = getattr(tokenizer, "chat_template", None) or ""
-    return "enable_thinking" in tmpl
-
-
-def build_prompt(tokenizer, messages: list, thinking: bool = True,
-                 thinking_budget: Optional[int] = None) -> str:
-    """Messages -> prompt string via the native template (plain fallback if none).
-
-    Lifted from the notebook so the app renders prompts identically. The
-    `enable_thinking` kwarg is what toggles the model's `<think>...</think>` block.
-    """
-    if tokenizer is not None and getattr(tokenizer, "chat_template", None):
-        base = dict(tokenize=False, add_generation_prompt=True)
-        if supports_thinking_kwarg(tokenizer):
-            base["enable_thinking"] = bool(thinking)
-            if thinking_budget is not None:           # best-effort across template variants
-                for k in ("thinking_budget", "reasoning_budget", "max_thinking_tokens"):
-                    try:
-                        return tokenizer.apply_chat_template(messages, **{**base, k: thinking_budget})
-                    except TypeError:
-                        continue
-        try:
-            return tokenizer.apply_chat_template(messages, **base)
-        except TypeError:
-            base.pop("enable_thinking", None)
-            return tokenizer.apply_chat_template(messages, **base)
-    # plain ChatML-ish fallback
-    sys_txt = "\n".join(m["content"] for m in messages if m["role"] == "system")
-    convo = "".join(f"<|{m['role']}|>\n{m['content']}\n" for m in messages if m["role"] != "system")
-    return (f"<|system|>\n{sys_txt}\n" if sys_txt else "") + convo + "<|assistant|>\n"
-
-
+# --------------------------------------------------------------------------- reasoning split
 def split_think(text: str):
     """Return (thinking, visible_answer).
 
@@ -273,22 +305,27 @@ def split_think(text: str):
 
 
 # --------------------------------------------------------------------------- streaming
-def stream_completion(handle: ServerHandle, prompt: str,
-                      sampling: SamplingConfig) -> Iterator[str]:
-    """Yield text deltas from llama-server's OpenAI-compatible /v1/completions.
+def stream_chat(handle: ServerHandle, messages: list, sampling: SamplingConfig, *,
+                thinking: bool, supports_thinking: bool) -> Iterator[Tuple[str, str]]:
+    """Yield (content_delta, reasoning_delta) from /v1/chat/completions (SSE).
 
-    Sends the already-rendered raw prompt (which bakes in the thinking switch), so
-    reasoning ON/OFF works per-call without relying on server-side templating.
+    Sends `messages`; the server applies the model's own chat template (`--jinja`) and,
+    with `--reasoning-format` set, returns reasoning in `delta.reasoning_content`
+    separately from the visible `delta.content`. For models that expose a thinking
+    switch, `chat_template_kwargs.enable_thinking` toggles it per request. Models that
+    instead emit inline `<think>...</think>` in content leave reasoning_delta empty and
+    are handled by `split_think` in the caller.
     """
     payload = dict(
-        prompt=prompt,
+        messages=messages,
         max_tokens=sampling.max_new_tokens,
         temperature=sampling.temperature,
         top_p=sampling.top_p,
-        stop=list(sampling.stop),
         stream=True,
     )
-    with requests.post(f"{handle.base_url}/v1/completions", json=payload,
+    if supports_thinking:
+        payload["chat_template_kwargs"] = {"enable_thinking": bool(thinking)}
+    with requests.post(f"{handle.base_url}/v1/chat/completions", json=payload,
                        stream=True, timeout=600) as r:
         r.raise_for_status()
         for raw in r.iter_lines():
@@ -304,6 +341,8 @@ def stream_completion(handle: ServerHandle, prompt: str,
                 obj = json.loads(data)
             except Exception:
                 continue
-            txt = (obj.get("choices") or [{}])[0].get("text", "")
-            if txt:
-                yield txt
+            delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+            content = delta.get("content") or ""
+            reasoning = delta.get("reasoning_content") or ""
+            if content or reasoning:
+                yield content, reasoning

@@ -18,22 +18,19 @@ class ServerConfig:
     host: str
     port: int
     binary_path: str
-    gguf_path: str
-    n_ctx: int
-    n_gpu_layers: int
-    flash_attn: bool
     startup_timeout_s: int
     reuse_existing: bool
+    # Shared runtime flags applied to whichever model the server launches.
+    flash_attn: bool
+    n_gpu_layers: int
+    cache_type_k: str
+    cache_type_v: str
+    jinja: bool             # apply each GGUF's embedded chat template (server-side)
+    reasoning_format: str   # how the server surfaces <think> (e.g. "deepseek" | "none")
 
     @property
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
-
-
-@dataclass(frozen=True)
-class TokenizerConfig:
-    repo_id: str
-    cache_dir: str
 
 
 @dataclass(frozen=True)
@@ -42,6 +39,32 @@ class SamplingConfig:
     top_p: float
     max_new_tokens: int
     stop: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    """One selectable model. Weights are either a local GGUF (`gguf_path`) or
+    auto-downloaded by llama-server from a Hugging Face repo (`hf_repo` + `quant`)."""
+    name: str
+    label: str
+    gguf_path: Optional[str]
+    hf_repo: Optional[str]
+    quant: Optional[str]
+    n_ctx: int
+    supports_thinking: bool
+    sampling: Optional[SamplingConfig]   # None -> fall back to AppConfig.sampling
+
+    @property
+    def identity(self) -> Tuple:
+        """Hashable cache key — a change in any field here means relaunch the server."""
+        return (self.name, self.gguf_path, self.hf_repo, self.quant, self.n_ctx)
+
+    @property
+    def hf_spec(self) -> Optional[str]:
+        """The `-hf` argument (repo[:quant]) for auto-download, or None for a local file."""
+        if not self.hf_repo:
+            return None
+        return f"{self.hf_repo}:{self.quant}" if self.quant else self.hf_repo
 
 
 @dataclass(frozen=True)
@@ -102,7 +125,8 @@ class GpuConfig:
 @dataclass(frozen=True)
 class AppConfig:
     server: ServerConfig
-    tokenizer: TokenizerConfig
+    models: Tuple[ModelConfig, ...]
+    active_model_name: str
     sampling: SamplingConfig
     reasoning: ReasoningConfig
     rag: RagConfig
@@ -126,6 +150,64 @@ def default_config_path() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.yaml")
 
 
+def _parse_model(entry: dict, app_dir: str) -> ModelConfig:
+    """Build one ModelConfig, validating it names exactly one weight source."""
+    gguf = entry.get("gguf_path")
+    hf_repo = entry.get("hf_repo")
+    quant = entry.get("quant")
+    has_local = bool(gguf)
+    has_hf = bool(hf_repo) and bool(quant)
+    if has_local == has_hf:  # exactly one source required
+        raise ValueError(
+            f"model '{entry.get('name')}' must set either gguf_path OR (hf_repo + quant), "
+            f"not both and not neither."
+        )
+    samp = entry.get("sampling")
+    sampling = (
+        SamplingConfig(
+            temperature=float(samp["temperature"]),
+            top_p=float(samp["top_p"]),
+            max_new_tokens=int(samp["max_new_tokens"]),
+            stop=tuple(samp.get("stop", ())),   # server-side templating handles stops
+        )
+        if samp else None
+    )
+    return ModelConfig(
+        name=str(entry["name"]),
+        label=str(entry["label"]),
+        gguf_path=_resolve(app_dir, gguf) if gguf else None,
+        hf_repo=hf_repo or None,
+        quant=quant or None,
+        n_ctx=int(entry["n_ctx"]),
+        supports_thinking=bool(entry.get("supports_thinking", False)),
+        sampling=sampling,
+    )
+
+
+def _parse_models(block: dict, app_dir: str) -> Tuple[Tuple[ModelConfig, ...], str]:
+    """Parse the models block into (models, active_name), validating names."""
+    available = block.get("available") or []
+    if not available:
+        raise ValueError("config 'models.available' is empty — at least one model is required.")
+    models = tuple(_parse_model(e, app_dir) for e in available)
+    names = [m.name for m in models]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"duplicate model name(s) in models.available: {dupes}")
+    active = str(block["active"])
+    if active not in names:
+        raise ValueError(f"models.active='{active}' is not one of {names}")
+    return models, active
+
+
+def model_by_name(cfg: "AppConfig", name: str) -> ModelConfig:
+    """Look up a model by its `name`; raises KeyError if absent."""
+    for m in cfg.models:
+        if m.name == name:
+            return m
+    raise KeyError(f"no model named '{name}' in config")
+
+
 def load_config(path: Optional[str] = None) -> AppConfig:
     """Read config.yaml and build a validated AppConfig with resolved paths."""
     cfg_path = path or default_config_path()
@@ -133,20 +215,19 @@ def load_config(path: Optional[str] = None) -> AppConfig:
     with open(cfg_path, encoding="utf-8") as fh:
         raw = yaml.safe_load(fh)
 
+    srv = raw["server"]
     server = ServerConfig(
-        host=raw["server"]["host"],
-        port=int(raw["server"]["port"]),
-        binary_path=_resolve(app_dir, raw["server"]["binary_path"]),
-        gguf_path=_resolve(app_dir, raw["server"]["gguf_path"]),
-        n_ctx=int(raw["server"]["n_ctx"]),
-        n_gpu_layers=int(raw["server"]["n_gpu_layers"]),
-        flash_attn=bool(raw["server"]["flash_attn"]),
-        startup_timeout_s=int(raw["server"]["startup_timeout_s"]),
-        reuse_existing=bool(raw["server"]["reuse_existing"]),
-    )
-    tokenizer = TokenizerConfig(
-        repo_id=raw["tokenizer"]["repo_id"],
-        cache_dir=_resolve(app_dir, raw["tokenizer"]["cache_dir"]),
+        host=srv["host"],
+        port=int(srv["port"]),
+        binary_path=_resolve(app_dir, srv["binary_path"]),
+        startup_timeout_s=int(srv["startup_timeout_s"]),
+        reuse_existing=bool(srv["reuse_existing"]),
+        flash_attn=bool(srv["flash_attn"]),
+        n_gpu_layers=int(srv["n_gpu_layers"]),
+        cache_type_k=str(srv["cache_type_k"]),
+        cache_type_v=str(srv["cache_type_v"]),
+        jinja=bool(srv["jinja"]),
+        reasoning_format=str(srv["reasoning_format"]),
     )
     sampling = SamplingConfig(
         temperature=float(raw["sampling"]["temperature"]),
@@ -154,6 +235,7 @@ def load_config(path: Optional[str] = None) -> AppConfig:
         max_new_tokens=int(raw["sampling"]["max_new_tokens"]),
         stop=tuple(raw["sampling"]["stop"]),
     )
+    models, active_model_name = _parse_models(raw["models"], app_dir)
     reasoning = ReasoningConfig(
         thinking_default=bool(raw["reasoning"]["thinking_default"]),
         thinking_budget=raw["reasoning"]["thinking_budget"],
@@ -200,7 +282,8 @@ def load_config(path: Optional[str] = None) -> AppConfig:
 
     return AppConfig(
         server=server,
-        tokenizer=tokenizer,
+        models=models,
+        active_model_name=active_model_name,
         sampling=sampling,
         reasoning=reasoning,
         rag=rag,

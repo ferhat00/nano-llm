@@ -1,18 +1,24 @@
 # nemotron-app — local Streamlit chat for Nemotron Nano 4B
 
-A local web app over **NVIDIA Nemotron-3-Nano-4B** running on your RTX 3060. It is
-the GUI sibling of [`../nemotron-local/`](../nemotron-local/): the notebook proves
-the model runs, this app gives it a chat UI with four extras:
+A local web app for running small LLMs on your RTX 3060 (12 GB), starting with
+**NVIDIA Nemotron-3-Nano-4B**. It is the GUI sibling of
+[`../nemotron-local/`](../nemotron-local/): the notebook proves the model runs, this
+app gives it a chat UI with these extras:
 
-- **Thinking mode** — toggle the model's `<think>…</think>` reasoning on/off.
+- **Model picker** — a sidebar dropdown switches between a curated set of 3–9B models
+  (Qwen3-4B, Phi-4-mini, Gemma 3 4B, Ministral 3, GLM-4-9B, Granite, SmolLM3, …) that
+  fit 12 GB. Only one model is held in VRAM at a time; non-local models are
+  auto-downloaded by llama-server on first use.
+- **Thinking mode** — toggle the model's `<think>…</think>` reasoning on/off (for
+  models that support it).
 - **Document RAG** — attach PDFs / txt / md / docx, ask questions over them (vector
   search with citations).
 - **Web search** — ground answers in live DuckDuckGo results (no API key).
 - **Coding help** — a coding-oriented mode with fenced, syntax-highlighted code.
 
-It **reuses the artifacts the notebook already downloaded** — the
-`llama-server.exe` binary, the GGUF weights, and the HF tokenizer cache — so there
-is nothing extra to download for the model itself.
+It **reuses the `llama-server.exe` binary the notebook already downloaded** plus the
+local Nemotron GGUF. Other models are fetched on demand via llama-server's `-hf`
+auto-download into its model cache.
 
 ## How it works
 
@@ -20,33 +26,35 @@ is nothing extra to download for the model itself.
 Streamlit (app.py)
    │  sidebar toggles: thinking · RAG · web · mode · sampling
    ▼
-nemo_app/  ── llm.py ──────► llama-server.exe  (OpenAI /v1, 127.0.0.1:8000)
+nemo_app/  ── llm.py ──────► llama-server.exe  (OpenAI /v1/chat/completions, :8000)
             ── rag.py ──────► Chroma (persistent) + bge-small embeddings (CPU)
             ── websearch.py ► DuckDuckGo (ddgs)
             ── prompts.py ──► assembles [system]+history+context+user
-            ── state.py ────► @st.cache_resource: server / tokenizer / embedder / store
+            ── state.py ────► @st.cache_resource: server / embedder / store
 ```
 
-- The app **detects a healthy llama-server** on `127.0.0.1:8000` and reuses it; if
-  none is running it launches one from the notebook's binary + GGUF. Either way
-  there is only ever **one copy of the weights** in VRAM.
-- Thinking is controlled client-side: prompts are rendered with the HF tokenizer's
-  `enable_thinking` switch and sent to `/v1/completions` (the path the notebook
-  verified).
-- Tools are driven by **explicit sidebar toggles**, not agentic tool-calling —
-  deterministic and reliable on a 4B model.
+- The app launches **one `llama-server.exe`** for the selected model and talks to its
+  OpenAI-compatible `/v1/chat/completions`. Switching models in the dropdown stops that
+  subprocess and starts a new one, so there is only ever **one copy of the weights** in
+  VRAM. It reuses an already-running server only if it is serving the same model
+  (verified via the server's properties endpoint).
+- Prompt templating is **server-side**: `--jinja` makes llama-server apply each GGUF's
+  own chat template and stop tokens, and `--reasoning-format` surfaces `<think>`
+  reasoning separately; the thinking toggle is passed per request via
+  `chat_template_kwargs`. This is what lets one code path serve many model families.
+- Tools are driven by **explicit sidebar toggles**, not agentic tool-calling.
 - Everything tunable lives in [`config.yaml`](config.yaml) (no magic numbers in code).
 
 ## Prerequisites
 
 1. The `nemotron-local` notebook has been run once so these exist (paths set in
    `config.yaml`):
-   - `../nemotron-local/llama-bin/bin/llama-server.exe`
-   - `../nemotron-local/models/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf`
-   - `../nemotron-local/hf-cache/hub/…` (tokenizer)
+   - `../nemotron-local/llama-bin/bin/llama-server.exe` — a **recent build**; it must
+     support `-hf`, `--jinja`, and `--reasoning-format`.
+   - `../nemotron-local/models/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf` (the default model).
 2. The RTX 3060 visible to `nvidia-smi`, recent NVIDIA driver.
-3. Internet on first run only (to fetch the `bge-small` embedding model, ~130 MB,
-   and any web searches).
+3. Internet on first run (for the `bge-small` embedding model ~130 MB, web searches, and
+   the one-time auto-download of any non-local model you select — several GB each).
 
 ## Setup & run
 
@@ -67,8 +75,12 @@ Tavily in `config.yaml`). Both are optional; the defaults need neither.
 
 ## Using it
 
+- **Model** (sidebar dropdown): pick a model; switching unloads the current one and
+  loads the selected one (only one in VRAM at a time). A non-local model downloads on
+  first selection (watch the VRAM meter / `data/server.log`). Switching clears the chat,
+  since templates and special tokens differ across models.
 - **Thinking mode** (sidebar toggle): on → answers include a collapsible *Thinking*
-  block; off → direct answers.
+  block; off → direct answers. Disabled for models that don't expose a thinking switch.
 - **Documents (RAG)**: upload files → **Index** → toggle *Use my documents* → ask.
   Retrieved sources show under each answer as `[filename p.N]`. *Clear docs* empties
   the store. The store persists on disk under `data/chroma/`.
@@ -97,10 +109,18 @@ process, so freeing VRAM means stopping that subprocess:
 
 ## Configuration
 
-Edit [`config.yaml`](config.yaml) — server paths/port, context length, sampling
-defaults, embedding model/device, chunk size/overlap, retrieval `top_k`, web result
-count, system prompts, and UI slider ranges. To use the lighter/heavier GGUF quant
-or a different model, point `server.gguf_path` at it.
+Edit [`config.yaml`](config.yaml) — shared server settings (binary path/port, the
+runtime flags applied to every model: `n_gpu_layers`, `flash_attn`, KV-cache types,
+`jinja`, `reasoning_format`), the `models:` catalog, sampling defaults, embedding
+model/device, chunk size/overlap, retrieval `top_k`, web result count, system prompts,
+and UI slider ranges.
+
+To add or change a model, edit `models.available`: each entry is either a local file
+(`gguf_path`) **or** an auto-download (`hf_repo` + `quant`, fetched via `-hf`), with its
+own `n_ctx`, `supports_thinking`, and optional per-model `sampling`. Set `models.active`
+to the model that loads at startup. Confirm a model's exact GGUF repo id and quant tag on
+its Hugging Face model card before first use (prefer official or `bartowski` GGUFs — they
+are ungated, so `-hf` needs no token).
 
 ## Scope notes
 

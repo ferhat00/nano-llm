@@ -24,18 +24,17 @@ if _APP_DIR not in sys.path:
 
 from dotenv import load_dotenv  # noqa: E402
 
-from nemo_app import gpu, llm, prompts, rag, websearch  # noqa: E402
+from nemo_app import config, gpu, llm, prompts, rag, websearch  # noqa: E402
 from nemo_app.state import (  # noqa: E402
     get_chroma_collection,
     get_config,
     get_embedder,
     get_server,
-    get_tokenizer,
 )
 
 load_dotenv(os.path.join(_APP_DIR, ".env"))
 
-st.set_page_config(page_title="Nemotron Nano 4B", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="Local LLM chat", page_icon="🧠", layout="wide")
 cfg = get_config()
 
 # --------------------------------------------------------------------------- session state
@@ -43,6 +42,7 @@ _DEFAULTS = {
     "messages": [],          # [{"role","content", optional "think", optional "sources"}]
     "indexed_files": set(),  # filenames added to the vector store this session
     "server_paused": False,  # True after "Free VRAM": keep the server stopped
+    "selected_model": cfg.active_model_name,  # which model the dropdown has selected
 }
 for key, default in _DEFAULTS.items():
     if key not in st.session_state:
@@ -113,7 +113,47 @@ def _shutdown_process() -> None:
 
 # --------------------------------------------------------------------------- sidebar
 with st.sidebar:
-    st.title("🧠 Nemotron Nano 4B")
+    st.title("🧠 Local LLM chat")
+
+    # --- model selector. Switching unloads the current model and loads the new one;
+    # only ever one copy of the weights in VRAM. Placed above the paused/status block
+    # so a paused app can switch straight into a different model.
+    model_names = [m.name for m in cfg.models]
+    model_labels = {m.name: m.label for m in cfg.models}
+    chosen = st.selectbox(
+        "Model", model_names,
+        index=model_names.index(st.session_state.selected_model),
+        format_func=lambda n: model_labels.get(n, n),
+        help="Switching unloads the current model and loads the selected one "
+             "(only one model is held in VRAM at a time).",
+    )
+    if chosen != st.session_state.selected_model:
+        # Tear down the currently-owned server (mirrors the "Free VRAM" path). Skip
+        # when paused — the server is already stopped and its cache cleared, so calling
+        # get_server here would wastefully relaunch the old model just to kill it.
+        if not st.session_state.server_paused:
+            try:
+                prev = config.model_by_name(cfg, st.session_state.selected_model)
+                old = get_server(prev.identity, cfg, prev)
+                if old.owned:
+                    llm.shutdown_server(old)
+            except Exception:
+                pass
+        get_server.clear()
+        if cfg.rag.embedding_device == "cuda":
+            get_embedder.clear()
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+        st.session_state.selected_model = chosen
+        st.session_state.server_paused = False    # selecting a model means "load it"
+        st.session_state.messages = []            # different template/special tokens
+        st.toast(f"Switched to {model_labels.get(chosen, chosen)} — chat cleared.")
+        st.rerun()
+
+    model = config.model_by_name(cfg, st.session_state.selected_model)
 
     # Server status / lifecycle. When paused (after "Free VRAM") we deliberately
     # skip get_server so the model is NOT reloaded on every rerun.
@@ -126,7 +166,7 @@ with st.sidebar:
             st.rerun()
     else:
         try:
-            handle = get_server(cfg)
+            handle = get_server(model.identity, cfg, model)
             server_ok = True
             where = "reused" if not handle.owned else "started"
             st.success(f"Model server connected ({where})")
@@ -184,8 +224,14 @@ with st.sidebar:
 
     st.divider()
     mode = st.radio("Mode", ["Chat", "Coding"], horizontal=True)
-    thinking = st.toggle("Thinking mode", value=cfg.reasoning.thinking_default,
-                         help="Toggle the model's <think> reasoning block.")
+    thinking = st.toggle(
+        "Thinking mode",
+        value=cfg.reasoning.thinking_default and model.supports_thinking,
+        disabled=not model.supports_thinking,
+        help=("Toggle the model's <think> reasoning block."
+              if model.supports_thinking
+              else "This model does not expose a thinking toggle."),
+    )
 
     with st.expander("Sampling", expanded=False):
         t_lo, t_hi = cfg.ui.temperature_range
@@ -263,7 +309,7 @@ with st.sidebar:
 
 
 # --------------------------------------------------------------------------- main chat area
-st.caption("Local NVIDIA Nemotron-3-Nano-4B · thinking · RAG · web search · coding help")
+st.caption(f"Local · {model.label} · thinking · RAG · web search · coding help")
 
 for msg in st.session_state.messages:
     render_message(msg)
@@ -301,32 +347,37 @@ if prompt:
         except Exception as exc:
             st.warning(f"Document retrieval failed: {exc}")
 
-    # ---- build the prompt and stream the answer ----
+    # ---- assemble messages and stream the answer (server-side templating) ----
     messages = prompts.assemble_messages(cfg, mode, history_for_model, prompt,
                                          rag_chunks=rag_chunks, web_results=web_results)
-    sampling = dataclasses.replace(cfg.sampling, temperature=temperature,
+    base_sampling = model.sampling or cfg.sampling
+    sampling = dataclasses.replace(base_sampling, temperature=temperature,
                                    top_p=top_p, max_new_tokens=max_new_tokens)
-    tokenizer = get_tokenizer(cfg.tokenizer.repo_id, cfg.tokenizer.cache_dir)
-    prompt_str = llm.build_prompt(tokenizer, messages, thinking=thinking,
-                                  thinking_budget=cfg.reasoning.thinking_budget)
+    think_on = thinking and model.supports_thinking
 
     with st.chat_message("assistant"):
         placeholder = st.empty()
-        acc = ""
+        content_acc = ""
+        reason_acc = ""
         try:
-            for piece in llm.stream_completion(handle, prompt_str, sampling):
-                acc += piece
-                placeholder.markdown(acc + " ▌")
+            for content_delta, reason_delta in llm.stream_chat(
+                handle, messages, sampling,
+                thinking=think_on, supports_thinking=model.supports_thinking,
+            ):
+                content_acc += content_delta
+                reason_acc += reason_delta
+                placeholder.markdown(content_acc + " ▌")
         except Exception as exc:
             placeholder.error(f"Generation failed: {exc}")
-        # When thinking is on, the template opened "<think>" in the prompt, so the
-        # completion holds only the reasoning + closing "</think>". Prepend the
-        # opening tag so split_think captures the reasoning (and truncations).
-        raw = ("<think>\n" + acc) if thinking else acc
-        think, answer = llm.split_think(raw)
+        # Reasoning may arrive in a dedicated field (--reasoning-format) or inline as
+        # <think>...</think> in the content; handle both.
+        if reason_acc.strip():
+            think, answer = reason_acc.strip(), content_acc.strip()
+        else:
+            think, answer = llm.split_think(content_acc)
         if not answer:
             answer = ("_(Response was truncated during reasoning — raise “Max new "
-                      "tokens”.)_" if think else acc)
+                      "tokens”.)_" if think else content_acc)
         placeholder.empty()
         if think:
             with st.expander("🧠 Thinking", expanded=False):

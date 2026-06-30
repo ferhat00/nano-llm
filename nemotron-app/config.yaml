@@ -5,19 +5,125 @@
 server:
   host: 127.0.0.1
   port: 8000
-  # Reuse the artifacts the nemotron-local notebook already downloaded.
+  # Reuse the llama-server.exe binary the nemotron-local notebook already downloaded.
   binary_path: ../nemotron-local/llama-bin/bin/llama-server.exe
-  gguf_path: ../nemotron-local/models/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf
-  n_ctx: 16384            # 16k; the SSM-hybrid KV cache makes this cheap
-  n_gpu_layers: 999       # offload every layer to the GPU (-ngl); -1 also means "all"
-  flash_attn: true        # Ampere (cc 8.6) supports FlashAttention -> -fa on
-  startup_timeout_s: 240  # how long to wait for /health after launching the server
-  reuse_existing: true    # if a server is already healthy on host:port, attach to it
+  startup_timeout_s: 1800   # generous: the first selection of an -hf model downloads several GB
+  reuse_existing: true      # attach to a healthy server on host:port ONLY if it runs the active model
+  # --- shared runtime, applied to whichever model is launched ---
+  flash_attn: true          # Ampere (cc 8.6) supports FlashAttention -> -fa on (prereq for KV-cache quant)
+  n_gpu_layers: 99          # offload every layer to the GPU (-ngl); any 3-6B fully fits 12 GB
+  cache_type_k: q8_0        # halve KV-cache VRAM at ~zero quality cost (needs flash_attn)
+  cache_type_v: q8_0
+  jinja: true               # apply each GGUF's own embedded chat template (server-side templating)
+  reasoning_format: deepseek  # server splits <think>...</think> into a separate reasoning_content field
 
-tokenizer:
-  # Weights-free AutoTokenizer load, only for apply_chat_template (enable_thinking).
-  repo_id: nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
-  cache_dir: ../nemotron-local/hf-cache/hub   # HF hub cache populated by the notebook
+# Selectable models (sidebar dropdown). Exactly one is resident in VRAM at a time.
+# Each entry is EITHER a local file (gguf_path) OR an auto-download (hf_repo + quant),
+# which llama-server fetches on first use via `-hf <repo>:<quant>`.
+# NOTE: repo ids / quant tags below should be confirmed against the live HF model card
+# before first run (some models post-date the project's notes; exact tags vary). Prefer
+# official or `bartowski` GGUF repos — they are ungated, so -hf needs no HF token.
+models:
+  active: nemotron-nano-4b    # which model loads at startup
+  available:
+    - name: nemotron-nano-4b
+      label: "Nemotron Nano 4B (Q4_K_M, local)"
+      gguf_path: ../nemotron-local/models/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf
+      hf_repo: null
+      quant: null
+      n_ctx: 16384            # the SSM-hybrid KV cache makes 16k cheap
+      supports_thinking: true
+      sampling: { temperature: 0.6, top_p: 0.95, max_new_tokens: 512 }
+
+    - name: qwen3-4b-instruct
+      label: "Qwen3 4B Instruct 2507 (general chat)"
+      gguf_path: null
+      hf_repo: Qwen/Qwen3-4B-Instruct-2507-GGUF
+      quant: Q6_K
+      n_ctx: 16384
+      supports_thinking: false
+      sampling: { temperature: 0.7, top_p: 0.8, max_new_tokens: 768 }
+
+    - name: qwen3-4b-thinking
+      label: "Qwen3 4B Thinking 2507 (reasoning/math)"
+      gguf_path: null
+      hf_repo: bartowski/Qwen_Qwen3-4B-Thinking-2507-GGUF
+      quant: Q6_K
+      n_ctx: 32768            # dedicated reasoner — budget generously for long <think> blocks
+      supports_thinking: true
+      sampling: { temperature: 0.6, top_p: 0.95, max_new_tokens: 2048 }
+
+    - name: phi-4-mini
+      label: "Phi-4 mini instruct (coding/math, MIT)"
+      gguf_path: null
+      hf_repo: bartowski/microsoft_Phi-4-mini-instruct-GGUF
+      quant: Q6_K
+      n_ctx: 16384
+      supports_thinking: false
+      sampling: { temperature: 0.7, top_p: 0.9, max_new_tokens: 768 }
+
+    - name: gemma-3-4b
+      label: "Gemma 3 4B it (long-context, multilingual)"
+      gguf_path: null
+      hf_repo: bartowski/google_gemma-3-4b-it-GGUF
+      quant: Q8_0
+      n_ctx: 16384
+      supports_thinking: false
+      sampling: { temperature: 0.7, top_p: 0.95, max_new_tokens: 768 }
+
+    - name: ministral-3-8b
+      label: "Ministral 3 8B instruct (Apache-2.0, all-round)"
+      gguf_path: null
+      hf_repo: bartowski/mistralai_Ministral-3-8B-Instruct-2512-GGUF
+      quant: Q4_K_M
+      n_ctx: 16384
+      supports_thinking: false
+      sampling: { temperature: 0.6, top_p: 0.95, max_new_tokens: 768 }
+
+    - name: ministral-3-3b
+      label: "Ministral 3 3B instruct (Apache-2.0, light)"
+      gguf_path: null
+      hf_repo: bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF
+      quant: Q6_K
+      n_ctx: 16384
+      supports_thinking: false
+      sampling: { temperature: 0.6, top_p: 0.95, max_new_tokens: 768 }
+
+    - name: glm-4-9b
+      label: "GLM-4 9B 0414 (tool-use/agentic; needs recent llama.cpp)"
+      gguf_path: null
+      hf_repo: bartowski/THUDM_GLM-4-9B-0414-GGUF
+      quant: Q4_K_M
+      n_ctx: 16384
+      supports_thinking: false
+      sampling: { temperature: 0.6, top_p: 0.95, max_new_tokens: 768 }
+
+    - name: granite-3.3-8b
+      label: "Granite 3.3 8B instruct (RAG/enterprise, Apache-2.0)"
+      gguf_path: null
+      hf_repo: bartowski/ibm-granite_granite-3.3-8b-instruct-GGUF
+      quant: Q5_K_M
+      n_ctx: 16384
+      supports_thinking: false
+      sampling: { temperature: 0.6, top_p: 0.9, max_new_tokens: 768 }
+
+    - name: aya-expanse-8b
+      label: "Aya Expanse 8B (multilingual; CC-BY-NC, 8k ctx)"
+      gguf_path: null
+      hf_repo: bartowski/CohereForAI_aya-expanse-8b-GGUF
+      quant: Q5_K_M
+      n_ctx: 8192             # model's native maximum
+      supports_thinking: false
+      sampling: { temperature: 0.7, top_p: 0.9, max_new_tokens: 768 }
+
+    - name: smollm3-3b
+      label: "SmolLM3 3B (fast/small, fully-open Apache-2.0)"
+      gguf_path: null
+      hf_repo: ggml-org/SmolLM3-3B-GGUF
+      quant: Q8_0
+      n_ctx: 16384
+      supports_thinking: true
+      sampling: { temperature: 0.6, top_p: 0.95, max_new_tokens: 768 }
 
 sampling:
   temperature: 0.6
