@@ -1,9 +1,9 @@
 """Cached resource factories — the linchpin for surviving Streamlit reruns.
 
 Streamlit re-executes the whole script on every interaction, so every heavy object
-(the llama-server handle, the tokenizer, the embedding model, the Chroma
-collection) is created inside an `@st.cache_resource` function and reused. The
-llama-server is therefore a single long-lived subprocess, not reloaded per rerun.
+(the llama-server handle, the embedding model, the Chroma collection) is created
+inside an `@st.cache_resource` function and reused. The llama-server is therefore a
+single long-lived subprocess, not reloaded per rerun.
 
 Args prefixed with `_` are not hashed by Streamlit's cache (used to pass the
 unhashable/rich config object through without re-keying the cache).
@@ -25,20 +25,15 @@ def get_config() -> AppConfig:
 
 
 @st.cache_resource(show_spinner="Starting llama-server (loading the model)…")
-def get_server(_cfg: AppConfig) -> llm.ServerHandle:
-    """Detect-or-start the llama-server once per session."""
-    return llm.ensure_server(_cfg, log_dir=_cfg.data_dir)
+def get_server(model_identity, _cfg: AppConfig, _model) -> llm.ServerHandle:
+    """Detect-or-start the llama-server for the active model.
 
-
-@st.cache_resource(show_spinner="Loading tokenizer…")
-def get_tokenizer(repo_id: str, cache_dir: str):
-    """Weights-free AutoTokenizer (only used for apply_chat_template/thinking)."""
-    from transformers import AutoTokenizer
-
-    token = os.environ.get("HF_TOKEN") or None
-    return AutoTokenizer.from_pretrained(
-        repo_id, cache_dir=cache_dir, token=token, trust_remote_code=True
-    )
+    `model_identity` (the hashable tuple from `ModelConfig.identity`) is the real cache
+    key, so selecting a different model is a cache miss → a fresh launch, and a stale
+    handle for the wrong model can never be served. `_cfg` / `_model` are passed through
+    unhashed (underscore prefix) so the rich config objects don't re-key the cache.
+    """
+    return llm.ensure_server(_cfg, _model, log_dir=_cfg.data_dir)
 
 
 @st.cache_resource(show_spinner="Loading embedding model…")
